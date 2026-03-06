@@ -234,78 +234,129 @@ class ByteTrackReID:
     """
 
     def __init__(self, reid_threshold: float = REID_THRESHOLD) -> None:
+        from supervision.tracker.byte_tracker.core import ByteTrack as _ByteTrack
         import supervision as sv
 
-        self._sv       = sv
-        self._tracker  = sv.ByteTracker(
+        self._sv        = sv
+        self._bt        = _ByteTrack(
             track_activation_threshold = 0.25,
             lost_track_buffer          = 60,
             minimum_matching_threshold = 0.8,
             frame_rate                 = 30,
         )
-        self._gallery   = _ReidGallery()
-        self._last_date = _date.today()
-        self._active_ids: set[int] = set()
+        self._gallery:    dict[int, _GalleryEntry] = {}   # display_id → entry
+        self._hist_cache: dict[int, np.ndarray]    = {}   # bt_id → hist
+        self._id_remap:   dict[int, int]           = {}   # bt_id → display_id
+        self._active_bt_ids: set[int]              = set()
+        self._last_date  = _date.today()
         self.reid_enabled = True
+        self._reid_thr    = reid_threshold
         logger.info("ByteTrackReID listo (cosine threshold=%.2f)", reid_threshold)
 
     def update(self, detections: list[dict], frame: np.ndarray) -> list[Track]:
         """Actualiza con detecciones del frame; retorna tracks activos."""
-        # Reinicio de galería a medianoche
+        # Medianoche: limpiar galería
         today = _date.today()
         if today != self._last_date:
             self._gallery.clear()
             self._last_date = today
             logger.info("Galería ReID reiniciada (nuevo día)")
 
-        if not detections:
-            empty = self._sv.Detections.empty()
-            self._tracker.update_with_detections(empty)
-            self._active_ids = set()
+        if detections:
+            bboxes  = np.array([d["bbox_xyxy"] for d in detections], dtype=np.float32)
+            confs   = np.array([d["conf"]      for d in detections], dtype=np.float32)
+            cls_ids = np.array([d["class_id"]  for d in detections], dtype=int)
+        else:
+            bboxes  = np.empty((0, 4), dtype=np.float32)
+            confs   = np.empty((0,),   dtype=np.float32)
+            cls_ids = np.empty((0,),   dtype=int)
+
+        sv_dets = self._sv.Detections(xyxy=bboxes, confidence=confs, class_id=cls_ids)
+        tracked = self._bt.update_with_detections(sv_dets)
+
+        if tracked.tracker_id is None or len(tracked.tracker_id) == 0:
+            self._flush_to_gallery(self._active_bt_ids)
+            self._active_bt_ids = set()
             return []
 
-        bboxes  = np.array([d["bbox_xyxy"] for d in detections], dtype=np.float32)
-        confs   = np.array([d["conf"]      for d in detections], dtype=np.float32)
-        cls_ids = np.array([d["class_id"]  for d in detections], dtype=int)
+        current_bt_ids = {int(tid) for tid in tracked.tracker_id}
 
-        sv_dets = self._sv.Detections(
-            xyxy       = bboxes,
-            confidence = confs,
-            class_id   = cls_ids,
-        )
-        tracked = self._tracker.update_with_detections(sv_dets)
+        # Tracks perdidos → guardar en galería
+        lost_ids = self._active_bt_ids - current_bt_ids
+        self._flush_to_gallery(lost_ids)
+        self._cleanup_gallery()
 
-        if tracked.tracker_id is None or len(tracked) == 0:
-            self._active_ids = set()
-            return []
+        # Tracks nuevos → intentar ReID
+        new_bt_ids = current_bt_ids - self._active_bt_ids
+        for bt_id in new_bt_ids:
+            idx  = list(int(t) for t in tracked.tracker_id).index(bt_id)
+            bbox = tuple(int(v) for v in tracked.xyxy[idx])
+            if frame is not None and self.reid_enabled:
+                hist = _compute_hsv_hist(frame, *bbox)
+                if hist is not None:
+                    self._hist_cache[bt_id] = hist
+                    match_id = self._gallery_match(hist)
+                    if match_id is not None:
+                        self._id_remap[bt_id] = match_id
+                        logger.info("ReID: bt=%d → id=%d restaurado", bt_id, match_id)
 
-        self._active_ids = set(int(tid) for tid in tracked.tracker_id)
+        self._active_bt_ids = current_bt_ids
 
         tracks = []
         for i in range(len(tracked)):
-            tid        = int(tracked.tracker_id[i])
+            bt_id = int(tracked.tracker_id[i])
+            tid   = self._id_remap.get(bt_id, bt_id)
             x1, y1, x2, y2 = map(int, tracked.xyxy[i])
-            y_centro   = (y1 + y2) / 2.0
-            conf_val   = float(tracked.confidence[i]) if tracked.confidence is not None else 0.0
+            y_centro = (y1 + y2) / 2.0
+            conf_val = float(tracked.confidence[i]) if tracked.confidence is not None else 0.0
 
-            # ReID: actualizar galería con histograma del crop
-            if self.reid_enabled and frame is not None:
+            # Actualizar histograma del track en caché
+            if frame is not None and self.reid_enabled:
                 hist = _compute_hsv_hist(frame, x1, y1, x2, y2)
                 if hist is not None:
-                    self._gallery.update(tid, hist)
+                    self._hist_cache[bt_id] = hist
 
             tracks.append(Track(
                 track_id  = tid,
                 bbox_xyxy = (x1, y1, x2, y2),
                 y_centro  = y_centro,
-                con_casco = False,   # requiere modelo con clase helmet
+                con_casco = False,
                 conf      = conf_val,
             ))
 
         return tracks
 
+    def _flush_to_gallery(self, bt_ids: set[int]) -> None:
+        now = time.time()
+        for bt_id in bt_ids:
+            hist = self._hist_cache.pop(bt_id, None)
+            if hist is None:
+                continue
+            display_id = self._id_remap.pop(bt_id, bt_id)
+            self._gallery[display_id] = _GalleryEntry(hist=hist, last_ts=now)
+
+    def _cleanup_gallery(self) -> None:
+        now     = time.time()
+        expired = [did for did, e in self._gallery.items()
+                   if now - e.last_ts > REID_GALLERY_TTL]
+        for did in expired:
+            del self._gallery[did]
+
+    def _gallery_match(self, hist: np.ndarray) -> Optional[int]:
+        active_display = set(self._id_remap.values())
+        best_id, best_sim = None, self._reid_thr - 1e-6
+        norm_q = np.linalg.norm(hist) + 1e-8
+        for did, entry in self._gallery.items():
+            if did in active_display:
+                continue
+            sim = float(np.dot(hist, entry.hist) /
+                        (norm_q * (np.linalg.norm(entry.hist) + 1e-8)))
+            if sim > best_sim:
+                best_sim, best_id = sim, did
+        return best_id
+
     def active_ids(self) -> set[int]:
-        return set(self._active_ids)
+        return set(self._active_bt_ids)
 
 
 def _compute_hsv_hist(frame: np.ndarray, x1, y1, x2, y2) -> Optional[np.ndarray]:
