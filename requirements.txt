@@ -1,0 +1,32 @@
+# Sistema de cronometraje de ciclistas — PC Linux x86_64 + CUDA GTX 1650
+#
+# Instalacion:
+#   pip install -r requirements.txt
+#
+# Para CUDA (GTX 1650 necesita CUDA 11.8 o 12.x instalado en el sistema):
+#   pip install onnxruntime-gpu
+#
+# Si no hay CUDA disponible, usar CPU:
+#   pip install onnxruntime
+
+# Vision artificial y procesamiento de imagen
+opencv-python>=4.9.0
+
+# Arrays numericos
+numpy>=1.24.0
+
+# Inferencia ONNX con CUDA — instalar UNO de los siguientes:
+# onnxruntime-gpu>=1.18.0    # GPU CUDA (GTX 1650 soportada)
+onnxruntime>=1.18.0          # CPU fallback (cambiar a onnxruntime-gpu para CUDA)
+
+# ByteTrack + utilidades de vision
+supervision>=0.21.0
+
+# Web — panel del juez
+flask>=3.0.0
+
+# Imagenes — popup con foto del ciclista
+pillow>=10.0.0
+
+# Excel — importar atletas en admin.py
+openpyxl>=3.1.0

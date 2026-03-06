@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Datos locales
+data/*.db
+data/*.db-shm
+data/*.db-wal
+data/captures/
+
+# Modelos grandes (binarios)
+models/*.onnx
+models/*.pt
+models/*.engine
+
+# Entorno virtual
+venv/
+.env
+
+# Exports
+exports/
