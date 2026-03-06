@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 
 # ─── Parámetros de la línea de meta ──────────────────────────────────────────
 
-LINEA_META_Y: int = 540       # Coordenada Y de la línea (píxeles).
-                               # 540 = centro de frame 1080p (USB2.0 camera).
+LINEA_META_Y: int = 360       # Coordenada Y de la línea (píxeles).
+                               # 360 = centro de frame 720p (1280x720).
                                # Ajustar según posición física de la cámara.
 TOLERANCIA: int = 5            # Semiancho de la banda de cruce (píxeles).
 COOLDOWN_NS: int = 3_000_000_000   # 3 s en nanosegundos — evita doble registro

@@ -29,22 +29,26 @@ logger = logging.getLogger(__name__)
 @dataclass
 class CropJob:
     """Solicitud de recorte enviada por el detector de cruce al worker."""
-    frame:     np.ndarray
-    track_id:  int
-    bbox_xyxy: tuple[int, int, int, int]
-    ts_ns:     int
-    con_casco: bool
-    dorsal:    str = "N/A"
+    frame:             np.ndarray
+    track_id:          int
+    bbox_xyxy:         tuple[int, int, int, int]
+    ts_ns:             int
+    con_casco:         bool
+    dorsal:            str           = "N/A"
+    tiempo_carrera_ms: Optional[int] = None
 
 
 @dataclass
 class DBRecord:
     """Registro listo para ser persistido en SQLite por el AsyncDBWriter."""
-    track_id:       int
-    ts_ns:          int
-    con_casco:      bool
-    dorsal:         str
-    foto_meta_path: Optional[str]
+    track_id:          int
+    ts_ns:             int
+    con_casco:         bool
+    dorsal:            str
+    foto_meta_path:    Optional[str]
+    tiempo_carrera_ms: Optional[int]       = None
+    dorsal_ocr:        Optional[str]       = None
+    crop_np:           Optional[np.ndarray] = None  # para OCR asíncrono
 
 
 # ─── Worker ───────────────────────────────────────────────────────────────────
@@ -85,22 +89,27 @@ class CropWorker(threading.Thread):
                 logger.info("CropWorker: parada recibida")
                 break
 
-            foto_path: Optional[str] = None
+            foto_path: Optional[str]        = None
+            crop_np:   Optional[np.ndarray] = None
             try:
-                foto_path = self._crop_and_save(job)
+                foto_path, crop_np = self._crop_and_save(job)
                 logger.debug("Captura: track=%d → %s", job.track_id, foto_path)
             except Exception:
                 logger.exception("Error en crop para track=%d", job.track_id)
 
+            # Enviar inmediatamente — el OCR corre en hilo separado en main_timing
             self._db_q.put(DBRecord(
-                track_id       = job.track_id,
-                ts_ns          = job.ts_ns,
-                con_casco      = job.con_casco,
-                dorsal         = job.dorsal,
-                foto_meta_path = foto_path,
+                track_id          = job.track_id,
+                ts_ns             = job.ts_ns,
+                con_casco         = job.con_casco,
+                dorsal            = job.dorsal,
+                foto_meta_path    = foto_path,
+                tiempo_carrera_ms = job.tiempo_carrera_ms,
+                crop_np           = crop_np,
             ))
 
-    def _crop_and_save(self, job: CropJob) -> str:
+    def _crop_and_save(self, job: CropJob) -> tuple[str, np.ndarray]:
+        """Recorta, mejora nitidez, guarda JPEG y devuelve (ruta, array)."""
         x1, y1, x2, y2 = job.bbox_xyxy
         h, w = job.frame.shape[:2]
         x1, y1 = max(0, x1), max(0, y1)
@@ -109,7 +118,13 @@ class CropWorker(threading.Thread):
         if x2 <= x1 or y2 <= y1:
             raise ValueError(f"BBox invalida: ({x1},{y1},{x2},{y2})")
 
-        crop = job.frame[y1:y2, x1:x2]
+        crop = job.frame[y1:y2, x1:x2].copy()
+
+        # Sharpening para foto de meta más nítida
+        kernel = np.array([[0, -0.5, 0],
+                            [-0.5, 3, -0.5],
+                            [0, -0.5, 0]], dtype=np.float32)
+        crop = cv2.filter2D(crop, -1, kernel)
 
         # Redimensionar si supera MAX_SIDE
         ch, cw = crop.shape[:2]
@@ -128,7 +143,7 @@ class CropWorker(threading.Thread):
         out_path = self._save_dir / date_str / f"t{job.track_id:04d}_{ts_ms}.jpg"
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(buf.tobytes())
-        return str(out_path)
+        return str(out_path), crop
 
     def stop(self) -> None:
         """Señal de parada al worker (no bloquea)."""

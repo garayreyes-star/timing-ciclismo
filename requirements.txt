@@ -30,3 +30,10 @@ pillow>=10.0.0
 
 # Excel — importar atletas en admin.py
 openpyxl>=3.1.0
+
+# OCR de dorsales — requiere binario Tesseract del sistema:
+#   sudo apt install tesseract-ocr tesseract-ocr-spa
+pytesseract>=0.3.10
+
+# Beep de cruce — audio no bloqueante
+sounddevice>=0.4.6

@@ -48,19 +48,42 @@ class DBManager:
                 PRAGMA journal_mode = WAL;
                 PRAGMA foreign_keys = ON;
                 CREATE TABLE IF NOT EXISTS corredores (
-                    id_registro    INTEGER PRIMARY KEY AUTOINCREMENT,
-                    track_id       INTEGER NOT NULL,
-                    dorsal         TEXT    DEFAULT 'N/A',
-                    tiempo_cruce   TEXT    NOT NULL,
-                    con_casco      INTEGER NOT NULL CHECK (con_casco IN (0, 1)),
-                    foto_meta_path TEXT,
+                    id_registro       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    track_id          INTEGER NOT NULL,
+                    dorsal            TEXT    DEFAULT 'N/A',
+                    tiempo_cruce      TEXT    NOT NULL,
+                    tiempo_carrera_ms INTEGER,
+                    con_casco         INTEGER NOT NULL CHECK (con_casco IN (0, 1)),
+                    foto_meta_path    TEXT,
                     UNIQUE (track_id, tiempo_cruce)
+                );
+                CREATE TABLE IF NOT EXISTS configuracion (
+                    clave TEXT PRIMARY KEY,
+                    valor TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_track_id     ON corredores (track_id);
                 CREATE INDEX IF NOT EXISTS idx_dorsal       ON corredores (dorsal);
                 CREATE INDEX IF NOT EXISTS idx_tiempo_cruce ON corredores (tiempo_cruce);
                 CREATE INDEX IF NOT EXISTS idx_con_casco    ON corredores (con_casco);
             """)
+        self._conn.commit()
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Agrega columnas/tablas faltantes en bases de datos existentes."""
+        cols = {row[1] for row in self._conn.execute("PRAGMA table_info(corredores)")}
+        if "tiempo_carrera_ms" not in cols:
+            self._conn.execute(
+                "ALTER TABLE corredores ADD COLUMN tiempo_carrera_ms INTEGER"
+            )
+            self._conn.commit()
+            logger.info("Migracion: columna tiempo_carrera_ms agregada")
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS configuracion (
+                clave TEXT PRIMARY KEY,
+                valor TEXT NOT NULL
+            )
+        """)
         self._conn.commit()
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -74,16 +97,18 @@ class DBManager:
         dorsal: str = "N/A",
         foto_meta_path: Optional[str] = None,
         tiempo_cruce: Optional[datetime] = None,
+        tiempo_carrera_ms: Optional[int] = None,
     ) -> Optional[int]:
         """
         Inserta un cruce de línea detectado.
 
         Args:
-            track_id:       ID de ByteTrack.
-            con_casco:      True si YOLO detectó casco en ese frame.
-            dorsal:         Texto devuelto por OCR, o 'N/A'.
-            foto_meta_path: Ruta al JPEG/PNG capturado por Mali-G610.
-            tiempo_cruce:   Si es None usa datetime.now() con microsegundos.
+            track_id:          ID de ByteTrack.
+            con_casco:         True si YOLO detectó casco en ese frame.
+            dorsal:            Texto devuelto por OCR, o 'N/A'.
+            foto_meta_path:    Ruta al JPEG capturado.
+            tiempo_cruce:      Si es None usa datetime.now() con microsegundos.
+            tiempo_carrera_ms: Milisegundos desde el inicio de carrera, o None.
 
         Returns:
             id_registro insertado, o None si era un duplicado.
@@ -95,15 +120,15 @@ class DBManager:
             cur = self._conn.execute(
                 """
                 INSERT INTO corredores
-                    (track_id, dorsal, tiempo_cruce, con_casco, foto_meta_path)
-                VALUES (?, ?, ?, ?, ?)
+                    (track_id, dorsal, tiempo_cruce, tiempo_carrera_ms, con_casco, foto_meta_path)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (track_id, dorsal, ts_str, int(con_casco), foto_meta_path),
+                (track_id, dorsal, ts_str, tiempo_carrera_ms, int(con_casco), foto_meta_path),
             )
             self._conn.commit()
             logger.debug(
-                "Cruce registrado — id=%d track=%d dorsal=%s casco=%s",
-                cur.lastrowid, track_id, dorsal, con_casco,
+                "Cruce registrado — id=%d track=%d dorsal=%s casco=%s carrera_ms=%s",
+                cur.lastrowid, track_id, dorsal, con_casco, tiempo_carrera_ms,
             )
             return cur.lastrowid
         except sqlite3.IntegrityError:
@@ -122,6 +147,94 @@ class DBManager:
             (dorsal, id_registro),
         )
         self._conn.commit()
+
+    # ── Inicio de carrera ─────────────────────────────────────────────────────
+
+    def guardar_inicio_carrera(self, ts_ns: int) -> None:
+        """Persiste el timestamp de inicio de carrera en nanosegundos."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO configuracion (clave, valor) VALUES ('inicio_carrera_ns', ?)",
+            (str(ts_ns),),
+        )
+        self._conn.commit()
+        logger.info("Inicio de carrera guardado: ts_ns=%d", ts_ns)
+
+    def get_inicio_carrera(self) -> Optional[int]:
+        """Retorna el timestamp de inicio de carrera en ns, o None si no se ha iniciado."""
+        row = self._conn.execute(
+            "SELECT valor FROM configuracion WHERE clave = 'inicio_carrera_ns'"
+        ).fetchone()
+        return int(row["valor"]) if row else None
+
+    def guardar_fin_carrera(self, ts_ns: int) -> None:
+        """Persiste el timestamp de fin de carrera en nanosegundos."""
+        self._conn.execute(
+            "INSERT OR REPLACE INTO configuracion (clave, valor) VALUES ('fin_carrera_ns', ?)",
+            (str(ts_ns),),
+        )
+        self._conn.commit()
+        logger.info("Fin de carrera guardado: ts_ns=%d", ts_ns)
+
+    def get_fin_carrera(self) -> Optional[int]:
+        """Retorna el timestamp de fin de carrera en ns, o None si la carrera sigue activa."""
+        row = self._conn.execute(
+            "SELECT valor FROM configuracion WHERE clave = 'fin_carrera_ns'"
+        ).fetchone()
+        return int(row["valor"]) if row else None
+
+    def exportar_csv(self, output_path: str | Path) -> int:
+        """
+        Exporta los resultados a CSV ordenados por categoría y tiempo.
+        Retorna la cantidad de filas exportadas.
+        """
+        import csv
+        rows = self._conn.execute("""
+            SELECT
+                c.id_registro,
+                c.dorsal,
+                c.tiempo_cruce,
+                c.tiempo_carrera_ms,
+                c.con_casco,
+                c.foto_meta_path,
+                COALESCE(a.nombre,    '—') AS nombre,
+                COALESCE(a.categoria, '—') AS categoria,
+                COALESCE(a.equipo,    '')  AS equipo
+            FROM corredores c
+            LEFT JOIN atletas a ON c.dorsal = a.dorsal
+            ORDER BY a.categoria, COALESCE(c.tiempo_carrera_ms, 999999999), c.tiempo_cruce
+        """).fetchall()
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _fmt_tiempo(ms):
+            if ms is None:
+                return ""
+            total_s  = ms // 1000
+            resto_ms = ms % 1000
+            return f"{total_s // 60:02d}:{total_s % 60:02d}.{resto_ms:03d}"
+
+        with open(output_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "Posicion", "Dorsal", "Nombre", "Categoria", "Equipo",
+                "Tiempo_carrera", "Tiempo_cruce", "Con_casco", "Foto"
+            ])
+            for pos, r in enumerate(rows, 1):
+                w.writerow([
+                    pos,
+                    r["dorsal"],
+                    r["nombre"],
+                    r["categoria"],
+                    r["equipo"],
+                    _fmt_tiempo(r["tiempo_carrera_ms"]),
+                    r["tiempo_cruce"],
+                    "Si" if r["con_casco"] else "No",
+                    r["foto_meta_path"] or "",
+                ])
+
+        logger.info("CSV exportado: %s  (%d filas)", output_path, len(rows))
+        return len(rows)
 
     # ── Atletas ───────────────────────────────────────────────────────────────
 
@@ -155,6 +268,7 @@ class DBManager:
                 c.id_registro,
                 c.dorsal,
                 c.tiempo_cruce,
+                c.tiempo_carrera_ms,
                 c.con_casco,
                 c.foto_meta_path,
                 COALESCE(a.nombre,    '—') AS nombre,
@@ -163,7 +277,7 @@ class DBManager:
             FROM corredores c
             LEFT JOIN atletas a ON c.dorsal = a.dorsal
             WHERE c.dorsal != 'N/A' AND c.dorsal IS NOT NULL
-            ORDER BY a.categoria, c.tiempo_cruce
+            ORDER BY a.categoria, COALESCE(c.tiempo_carrera_ms, 999999999), c.tiempo_cruce
         """).fetchall()
 
     def obtener_cruces(
