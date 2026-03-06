@@ -830,8 +830,12 @@ class TimingPipeline:
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _open_camera(self) -> cv2.VideoCapture:
+        import platform
         if isinstance(self._camera_src, int):
-            cap = cv2.VideoCapture(self._camera_src, cv2.CAP_V4L2)
+            if platform.system() == "Windows":
+                cap = cv2.VideoCapture(self._camera_src, cv2.CAP_DSHOW)
+            else:
+                cap = cv2.VideoCapture(self._camera_src, cv2.CAP_V4L2)
         else:
             cap = cv2.VideoCapture(self._camera_src)
 
